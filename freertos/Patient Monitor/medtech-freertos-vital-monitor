@@ -1,0 +1,722 @@
+/**
+ * @file    main.c
+ * @brief   Patient Vital Signs Monitor — FreeRTOS POSIX Simulation
+ * @author  Sakthi
+ * @version 1.0.0
+ * @date    2026
+ *
+ * @details This project implements a production-inspired real-time patient
+ *          monitoring system using FreeRTOS, simulated on Linux via the
+ *          FreeRTOS POSIX port. It monitors four vital signs concurrently
+ *          using independent prioritized tasks, with a unified telemetry
+ *          logging pipeline, multi-vital alert aggregation, direct UI
+ *          notifications, and a software watchdog for task liveness tracking.
+ *
+ *          System Architecture:
+ *          @code
+ *          ┌──────────────────────────────────────────────────────────┐
+ *          │  Sensor Tasks: HR(P4), SpO2(P4), BP(P3), Temp(P2)       │
+ *          │       │                │                                 │
+ *          │  Stream Buffer    Event Group         Task Notification  │
+ *          │  (telemetry log)  (abnormal detect)   (UI alert)        │
+ *          │       │                │                    │            │
+ *          │  Logging Task    Critical Alert Task   Display Task     │
+ *          │  (P1)            (P5)                  (P1)             │
+ *          │                                                          │
+ *          │  Watchdog Task (P6) ──► Safe Shutdown on failure        │
+ *          │  Health Monitor (P1) ──► System diagnostics every 10s  │
+ *          └──────────────────────────────────────────────────────────┘
+ *          @endcode
+ *
+ *          FreeRTOS APIs Demonstrated:
+ *          - xTaskCreate, vTaskDelay, taskENTER/EXIT_CRITICAL
+ *          - xStreamBufferCreate, xStreamBufferSend, xStreamBufferReceive
+ *          - xEventGroupCreate, xEventGroupSetBits, xEventGroupWaitBits
+ *          - xTaskNotify (eSetBits), xTaskNotifyWait
+ *          - xSemaphoreCreateMutex, xSemaphoreTake, xSemaphoreGive
+ *          - vTaskList, xPortGetFreeHeapSize
+ *
+ *          Defensive Coding Patterns (IEC 62304 inspired):
+ *          - NULL/pdPASS validation on all FreeRTOS object creation
+ *          - Bounded mutex timeouts (100ms) to detect deadlocks
+ *          - Sensor data range validation before processing
+ *          - Software watchdog with per-task liveness bitmask
+ *          - Controlled safe shutdown on system fault detection
+ *
+ * @note    Simulated on Linux/WSL using FreeRTOS POSIX Simulator.
+ *          In production hardware (STM32/ESP32), sensor reads would
+ *          replace rand() calls and hardware IWDG would replace the
+ *          software watchdog shutdown pattern.
+ *
+ * @see     https://www.freertos.org/Documentation/RTOS_book.html
+ * @see     IEC 62304:2006 — Medical Device Software Lifecycle Processes
+ */
+
+#include <stdio.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "timers.h"
+#include <stdlib.h>
+#include "semphr.h"
+#include "event_groups.h"
+#include "stream_buffer.h"
+
+/* ========================================================================== */
+/*                        BITMASK DEFINITIONS                                 */
+/* ========================================================================== */
+
+/** @defgroup EventGroupBits Event Group Alert Bitmasks
+ *  @brief Bit flags used to signal abnormal vital parameters via event group.
+ *  @{
+ */
+#define BIT_HR_ABNORMAL   (1 << 0) /**< Heart rate outside 60-100 BPM range   */
+#define BIT_SpO2_ABNORMAL (1 << 1) /**< SpO2 below 96% — hypoxemia risk        */
+#define BIT_BP_ABNORMAL   (1 << 2) /**< Blood pressure outside 80-120 mmHg    */
+#define BIT_TEMP_ABNORMAL (1 << 3) /**< Temperature above 100.0°F — fever      */
+/** @} */
+
+/** @defgroup WatchdogBits Software Watchdog Liveness Bitmasks
+ *  @brief Each sensor task sets its bit every cycle to prove it is alive.
+ *  @{
+ */
+#define WATCHDOG_HR   (1 << 0) /**< Heart rate task alive flag   */
+#define WATCHDOG_SPO2 (1 << 1) /**< SpO2 task alive flag         */
+#define WATCHDOG_BP   (1 << 2) /**< Blood pressure task alive flag */
+#define WATCHDOG_TEMP (1 << 3) /**< Temperature task alive flag  */
+
+/** @brief All four sensor tasks must kick within the watchdog window */
+#define WATCHDOG_ALL_BITS (WATCHDOG_HR | WATCHDOG_SPO2 | WATCHDOG_BP | WATCHDOG_TEMP)
+/** @} */
+
+/** @defgroup NotifyBits Task Notification UI Alert Flags
+ *  @brief Bit flags sent directly to display task via xTaskNotify (eSetBits).
+ *  @{
+ */
+#define NOTIFY_HR_ALERT   (1UL << 0) /**< Heart rate UI alert flag   */
+#define NOTIFY_SPO2_ALERT (1UL << 1) /**< SpO2 UI alert flag         */
+#define NOTIFY_BP_ALERT   (1UL << 2) /**< Blood pressure UI alert flag */
+#define NOTIFY_TEMP_ALERT (1UL << 3) /**< Temperature UI alert flag  */
+/** @} */
+
+/* ========================================================================== */
+/*                        GLOBAL HANDLES & STATE                              */
+/* ========================================================================== */
+
+/**
+ * @brief Software watchdog kick register.
+ * @note  Each sensor task ORs its bit into this register every cycle.
+ *        The watchdog task checks all bits are set within a 5-second window.
+ *        Declared volatile to prevent compiler from caching the value across
+ *        preemptive context switches between tasks.
+ */
+volatile uint32_t ulWatchdogKickRegister = 0;
+
+/** @brief Event group handle — broadcasts abnormal vital parameter events */
+EventGroupHandle_t   xVitalAlertGroup;
+
+/** @brief Mutex serializing multi-producer writes to xLogStreamBuffer */
+SemaphoreHandle_t    xBufferMutex;
+
+/** @brief Mutex protecting direct printf calls (watchdog status, UI alerts) */
+SemaphoreHandle_t    xPrintMutex;
+
+/** @brief Task handle of display task — target for xTaskNotify UI alerts */
+TaskHandle_t         xDisplayTaskHandle;
+
+/** @brief Stream buffer carrying formatted telemetry strings to logging task */
+StreamBufferHandle_t xLogStreamBuffer;
+
+/* ========================================================================== */
+/*                        TYPE DEFINITIONS                                    */
+/* ========================================================================== */
+
+/**
+ * @brief System fault classification codes.
+ * @details Used by vLogError() to categorize faults and route them to the
+ *          telemetry stream for persistent logging.
+ */
+typedef enum {
+    ERR_NONE            = 0, /**< No error — nominal operation              */
+    ERR_QUEUE_FULL,          /**< Queue send rejected — buffer at capacity  */
+    ERR_MUTEX_TIMEOUT,       /**< Mutex not acquired within timeout window  */
+    ERR_INVALID_DATA,        /**< Sensor reading outside valid physical range */
+    ERR_STACK_OVERFLOW,      /**< Task stack high water mark critically low */
+    ERR_TASK_CREATE_FAILED,  /**< xTaskCreate returned non-pdPASS           */
+    ERR_WATCHDOG_TIMEOUT     /**< Task failed to kick watchdog within window */
+} ErrorCode_t;
+
+/**
+ * @brief Patient physiological data container.
+ * @details Declared locally inside each sensor task to ensure full data
+ *          isolation — each task owns its own copy on its private stack,
+ *          eliminating inter-task race conditions without requiring a mutex.
+ */
+typedef struct {
+    int   heartRate; /**< Heart rate in BPM.         Valid range: 30–200    */
+    int   SpO2;      /**< Blood oxygen saturation %.  Valid range: 70–100   */
+    float Temp;      /**< Body temperature in °F.    Valid range: 90.0–110.0 */
+    int   BP;        /**< Blood pressure in mmHg.    Valid range: 60–180    */
+} PatientData_t;
+
+/* ========================================================================== */
+/*                        UTILITY FUNCTIONS                                   */
+/* ========================================================================== */
+
+/**
+ * @brief Thread-safe system fault logger.
+ * @details Formats an error record and pushes it into the shared stream buffer
+ *          for consumption by the logging task. Uses xBufferMutex to serialize
+ *          concurrent writes from multiple producer tasks.
+ * @param error    ErrorCode_t value classifying the fault condition.
+ * @param taskName Null-terminated string identifying the faulting context.
+ * @note   Mutex timeout is bounded to 100ms to prevent task starvation
+ *         if a deadlock condition is present in the system.
+ */
+void vLogError(ErrorCode_t error, const char *taskName) {
+    char cTxBuffer[128];
+    int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                       "[Error Log] Code: %d | Error: %s\n", error, taskName);
+    if (len > 0) {
+        /* Serialize write — multiple tasks call this concurrently */
+        xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100));
+        xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+        xSemaphoreGive(xBufferMutex);
+    }
+}
+
+/* ========================================================================== */
+/*                        SENSOR TASKS                                        */
+/* ========================================================================== */
+
+/**
+ * @brief Heart rate sensor simulation and telemetry task.
+ * @details Simulates a 2Hz (500ms) heart rate sensor. Validates the reading
+ *          against the physically possible range before transmission.
+ *          Uses dual-path alerting: stream buffer for logging and event group
+ *          for critical alert task, plus task notification for UI display.
+ *          Kicks the software watchdog after each successful read cycle.
+ * @param pvParametr FreeRTOS task parameter — unused.
+ * @note   Clinical alert threshold: <60 BPM (bradycardia) or >100 BPM (tachycardia).
+ *         Physical validity range: 30–200 BPM.
+ * @priority 4
+ */
+void vHeartRate(void *pvParametr) {
+    char cTxBuffer[128];
+    PatientData_t PatientData; /* Task-local — no shared memory race risk */
+
+    while(1) {
+        /* Simulate atomic hardware sensor register read */
+        taskENTER_CRITICAL();
+        PatientData.heartRate = 70 + (rand() % 50);
+        taskEXIT_CRITICAL();
+
+        /* Prove task is alive to watchdog monitor */
+        ulWatchdogKickRegister |= WATCHDOG_HR;
+
+        /* Discard physically impossible readings — sensor fault or noise */
+        if (PatientData.heartRate < 30 || PatientData.heartRate > 200) {
+            vLogError(ERR_INVALID_DATA, "Invalid HR reading");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* Push formatted telemetry into stream buffer */
+        if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            vLogError(ERR_MUTEX_TIMEOUT, "HeartRate: BufferMutex timeout");
+        } else {
+            int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                               "Heart Rate: %d BPM\n", PatientData.heartRate);
+            if (len > 0) {
+                xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+            }
+            xSemaphoreGive(xBufferMutex);
+        }
+
+        /* Dual-path alert on clinical threshold breach */
+        if (PatientData.heartRate < 60 || PatientData.heartRate > 100) {
+            xTaskNotify(xDisplayTaskHandle, NOTIFY_HR_ALERT, eSetBits);
+            xEventGroupSetBits(xVitalAlertGroup, BIT_HR_ABNORMAL);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500)); /* 2Hz sampling rate */
+    }
+}
+
+/**
+ * @brief SpO2 (blood oxygen saturation) sensor simulation task.
+ * @details Simulates a 0.5Hz (2000ms) pulse oximeter sensor.
+ *          Clinical alert threshold: <96% indicates early hypoxemia risk.
+ * @param pvParametr FreeRTOS task parameter — unused.
+ * @note   Physical validity range: 70–100%. Below 70% is medically incompatible
+ *         with consciousness and indicates a corrupt sensor reading.
+ * @priority 4
+ */
+void vSpO2(void *pvParametr) {
+    char cTxBuffer[128];
+    PatientData_t PatientData;
+
+    while(1) {
+        taskENTER_CRITICAL();
+        PatientData.SpO2 = 94 + (rand() % 6);
+        taskEXIT_CRITICAL();
+
+        ulWatchdogKickRegister |= WATCHDOG_SPO2;
+
+        if (PatientData.SpO2 < 70 || PatientData.SpO2 > 100) {
+            vLogError(ERR_INVALID_DATA, "Invalid SpO2 reading");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            vLogError(ERR_MUTEX_TIMEOUT, "SpO2: BufferMutex timeout");
+        } else {
+            int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                               "SpO2: %d%%\n", PatientData.SpO2);
+            if (len > 0) {
+                xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+            }
+            xSemaphoreGive(xBufferMutex);
+        }
+
+        if (PatientData.SpO2 < 96) {
+            xTaskNotify(xDisplayTaskHandle, NOTIFY_SPO2_ALERT, eSetBits);
+            xEventGroupSetBits(xVitalAlertGroup, BIT_SpO2_ABNORMAL);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+/**
+ * @brief Blood pressure sensor simulation task.
+ * @details Simulates a 1Hz (1000ms) blood pressure sensor.
+ *          Clinical alert threshold: <80 mmHg (hypotension) or >120 mmHg (hypertension).
+ * @param pvParametr FreeRTOS task parameter — unused.
+ * @note   Physical validity range: 60–180 mmHg.
+ * @priority 3
+ */
+void vBP(void *pvParametr) {
+    char cTxBuffer[128];
+    PatientData_t PatientData;
+
+    while(1) {
+        taskENTER_CRITICAL();
+        PatientData.BP = 80 + (rand() % 40);
+        taskEXIT_CRITICAL();
+
+        ulWatchdogKickRegister |= WATCHDOG_BP;
+
+        if (PatientData.BP < 60 || PatientData.BP > 180) {
+            vLogError(ERR_INVALID_DATA, "Invalid BP reading");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            vLogError(ERR_MUTEX_TIMEOUT, "BP: BufferMutex timeout");
+        } else {
+            int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                               "Blood Pressure: %d mmHg\n", PatientData.BP);
+            if (len > 0) {
+                xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+            }
+            xSemaphoreGive(xBufferMutex);
+        }
+
+        if (PatientData.BP < 80 || PatientData.BP > 120) {
+            xTaskNotify(xDisplayTaskHandle, NOTIFY_BP_ALERT, eSetBits);
+            xEventGroupSetBits(xVitalAlertGroup, BIT_BP_ABNORMAL);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/**
+ * @brief Body temperature sensor simulation task.
+ * @details Simulates a 1Hz (1000ms) thermistor-based temperature sensor.
+ *          Clinical alert threshold: >100.0°F indicates fever.
+ * @param pvParametr FreeRTOS task parameter — unused.
+ * @note   Physical validity range: 90.0–110.0°F.
+ *         Uses float for sub-degree precision — PatientData.Temp declared float.
+ * @priority 2
+ */
+void vTemperature(void *pvParametr) {
+    char cTxBuffer[128];
+    PatientData_t PatientData;
+
+    while(1) {
+        taskENTER_CRITICAL();
+        PatientData.Temp = 96.0f + (rand() % 30) / 10.0f;
+        taskEXIT_CRITICAL();
+
+        ulWatchdogKickRegister |= WATCHDOG_TEMP;
+
+        if (PatientData.Temp < 90.0f || PatientData.Temp > 110.0f) {
+            vLogError(ERR_INVALID_DATA, "Invalid Temperature reading");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            vLogError(ERR_MUTEX_TIMEOUT, "Temp: BufferMutex timeout");
+        } else {
+            int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                               "Temperature: %.1f F\n", PatientData.Temp);
+            if (len > 0) {
+                xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+            }
+            xSemaphoreGive(xBufferMutex);
+        }
+
+        if (PatientData.Temp > 100.0f) {
+            xTaskNotify(xDisplayTaskHandle, NOTIFY_TEMP_ALERT, eSetBits);
+            xEventGroupSetBits(xVitalAlertGroup, BIT_TEMP_ABNORMAL);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/* ========================================================================== */
+/*                        ALERT & DISPLAY TASKS                               */
+/* ========================================================================== */
+
+/**
+ * @brief Multi-vital critical alert aggregation task.
+ * @details Blocks on the event group waiting for ANY vital to breach its
+ *          clinical threshold. Uses pdFALSE (OR-wait) so any single abnormal
+ *          vital triggers an immediate response. All alerts are routed through
+ *          the stream buffer for unified, persistent logging.
+ * @param pvParameter FreeRTOS task parameter — unused.
+ * @note   pdTRUE clears bits after reading — resets for next event cycle.
+ *         Higher priority than sensor tasks ensures preemptive response.
+ * @priority 5
+ */
+void vCriticalAlert(void *pvParameter) {
+    char cTxBuffer[128];
+
+    while(1) {
+        /* Block until ANY vital parameter exceeds its clinical threshold */
+        EventBits_t bits = xEventGroupWaitBits(
+            xVitalAlertGroup,
+            BIT_HR_ABNORMAL | BIT_SpO2_ABNORMAL |
+            BIT_BP_ABNORMAL | BIT_TEMP_ABNORMAL,
+            pdTRUE,       /* Clear bits after reading — reset for next event */
+            pdFALSE,      /* OR-wait: ANY single bit is sufficient to unblock */
+            portMAX_DELAY /* Block indefinitely until an alert fires */
+        );
+
+        /* Route each triggered alert through the unified telemetry pipeline */
+        if (bits & BIT_HR_ABNORMAL) {
+            if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                                   "[CRITICAL] Heart Rate abnormal!\n");
+                if (len > 0) xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+                xSemaphoreGive(xBufferMutex);
+            } else { vLogError(ERR_MUTEX_TIMEOUT, "CritAlert: BufferMutex timeout"); }
+        }
+        if (bits & BIT_SpO2_ABNORMAL) {
+            if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                                   "[CRITICAL] SpO2 abnormal!\n");
+                if (len > 0) xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+                xSemaphoreGive(xBufferMutex);
+            } else { vLogError(ERR_MUTEX_TIMEOUT, "CritAlert: BufferMutex timeout"); }
+        }
+        if (bits & BIT_BP_ABNORMAL) {
+            if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                                   "[CRITICAL] BP abnormal!\n");
+                if (len > 0) xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+                xSemaphoreGive(xBufferMutex);
+            } else { vLogError(ERR_MUTEX_TIMEOUT, "CritAlert: BufferMutex timeout"); }
+        }
+        if (bits & BIT_TEMP_ABNORMAL) {
+            if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int len = snprintf(cTxBuffer, sizeof(cTxBuffer),
+                                   "[CRITICAL] Temperature abnormal!\n");
+                if (len > 0) xStreamBufferSend(xLogStreamBuffer, cTxBuffer, len, portMAX_DELAY);
+                xSemaphoreGive(xBufferMutex);
+            } else { vLogError(ERR_MUTEX_TIMEOUT, "CritAlert: BufferMutex timeout"); }
+        }
+    }
+}
+
+/**
+ * @brief Secondary UI notification display task.
+ * @details Receives direct task notifications from sensor tasks when vitals
+ *          breach clinical thresholds. Provides a lightweight secondary alert
+ *          channel parallel to the critical alert task. Uses xTaskNotifyWait
+ *          with full 32-bit clear mask to consume all pending notification bits.
+ * @param pvParameter FreeRTOS task parameter — unused.
+ * @note   Task notifications have zero heap overhead vs semaphores and execute
+ *         up to 45% faster — ideal for high-frequency UI update signaling.
+ * @priority 1 — lowest priority, runs only during idle periods
+ */
+void vDisplayTask(void *pvParameter) {
+    uint32_t ulNotificationValue;
+
+    while(1) {
+        /* Block until any sensor task sends a direct notification */
+        xTaskNotifyWait(
+            0,           /* Don't clear bits on entry */
+            0xFFFFFFFF,  /* Clear all bits on exit */
+            &ulNotificationValue,
+            portMAX_DELAY
+        );
+
+        /* Print corresponding UI alert for each set notification bit */
+        if (ulNotificationValue & NOTIFY_HR_ALERT) {
+            if (xSemaphoreTake(xPrintMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                printf("[Notify] Heart Rate needs attention\n");
+                xSemaphoreGive(xPrintMutex);
+            }
+        }
+        if (ulNotificationValue & NOTIFY_SPO2_ALERT) {
+            if (xSemaphoreTake(xPrintMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                printf("[Notify] SpO2 needs attention\n");
+                xSemaphoreGive(xPrintMutex);
+            }
+        }
+        if (ulNotificationValue & NOTIFY_BP_ALERT) {
+            if (xSemaphoreTake(xPrintMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                printf("[Notify] BP needs attention\n");
+                xSemaphoreGive(xPrintMutex);
+            }
+        }
+        if (ulNotificationValue & NOTIFY_TEMP_ALERT) {
+            if (xSemaphoreTake(xPrintMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                printf("[Notify] Temperature needs attention\n");
+                xSemaphoreGive(xPrintMutex);
+            }
+        }
+    }
+}
+
+/* ========================================================================== */
+/*                        SYSTEM MONITORING TASKS                             */
+/* ========================================================================== */
+
+/**
+ * @brief System fault handler — initiates controlled safe shutdown sequence.
+ * @details Called by the watchdog task when one or more sensor tasks fail to
+ *          check in within the monitoring window. Prints a staff alert and
+ *          halts the system. In production hardware, this function would stop
+ *          kicking the hardware IWDG (Independent Watchdog), triggering an
+ *          automatic MCU hardware reset via the watchdog peripheral.
+ * @note   while(1) here represents the halted-pending-hardware-reset state.
+ *         On STM32: stop calling HAL_IWDG_Refresh() → hardware resets chip.
+ *         On ESP32: stop calling esp_task_wdt_reset() → hardware resets chip.
+ */
+void vSafeShutdown(void) {
+    printf("[SYSTEM] Critical failure detected!\n");
+    printf("[SYSTEM] *** ALERT — STAFF NEEDED IMMEDIATELY ***\n");
+    printf("[SYSTEM] Initiating safe shutdown — hardware reset pending...\n");
+    while(1); /* Halt: in production hardware, IWDG resets MCU from here */
+}
+
+/**
+ * @brief High-priority software watchdog task.
+ * @details Monitors liveness of all four sensor tasks by checking a shared
+ *          bitmask register. Each sensor task ORs its assigned bit into
+ *          ulWatchdogKickRegister every cycle. If any bit is missing after
+ *          a 5-second window, the corresponding task has hung or crashed,
+ *          and safe shutdown is triggered.
+ * @param pvParameter FreeRTOS task parameter — unused.
+ * @note   Priority 6 — highest in the system. Must never be starved or
+ *         delayed by lower-priority tasks to maintain timing integrity.
+ *         The kick register is reset to zero after each check window.
+ * @priority 6
+ */
+void vWatchDogTask(void *pvParameter) {
+    while(1) {
+        /* Watchdog monitoring window — all tasks must kick within this period */
+        vTaskDelay(pdMS_TO_TICKS(5000));
+
+        if (ulWatchdogKickRegister != WATCHDOG_ALL_BITS) {
+            /* Identify and log which specific tasks failed to respond */
+            if (!(ulWatchdogKickRegister & WATCHDOG_HR))
+                vLogError(ERR_WATCHDOG_TIMEOUT, "Watchdog: HR task not responding");
+            if (!(ulWatchdogKickRegister & WATCHDOG_SPO2))
+                vLogError(ERR_WATCHDOG_TIMEOUT, "Watchdog: SpO2 task not responding");
+            if (!(ulWatchdogKickRegister & WATCHDOG_BP))
+                vLogError(ERR_WATCHDOG_TIMEOUT, "Watchdog: BP task not responding");
+            if (!(ulWatchdogKickRegister & WATCHDOG_TEMP))
+                vLogError(ERR_WATCHDOG_TIMEOUT, "Watchdog: Temp task not responding");
+
+            vSafeShutdown(); /* Initiate controlled fault recovery */
+        } else {
+            /* All sensor tasks healthy — log system status */
+            if (xSemaphoreTake(xPrintMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                printf("[Watchdog] All tasks alive — system nominal\n");
+                xSemaphoreGive(xPrintMutex);
+            }
+        }
+
+        /* Reset register for next 5-second monitoring window */
+        ulWatchdogKickRegister = 0;
+    }
+}
+
+/**
+ * @brief Periodic system health diagnostics task.
+ * @details Prints the full FreeRTOS task state table and heap statistics
+ *          every 10 seconds. Provides runtime visibility into task states,
+ *          stack high water marks, and remaining heap — essential for
+ *          IEC 62304 software verification and system stress testing.
+ * @param pvParameter FreeRTOS task parameter — unused.
+ * @note   Requires configUSE_TRACE_FACILITY = 1 and
+ *         configUSE_STATS_FORMATTING_FUNCTIONS = 1 in FreeRTOSConfig.h.
+ *         Stack size of 2048 words required — vTaskList() uses significant stack.
+ * @priority 1
+ */
+void vHealthMonitor(void *pvParameter) {
+    char pcBuffer[2048]; /* Buffer sized for vTaskList() output */
+
+    while(1) {
+        vTaskDelay(pdMS_TO_TICKS(10000)); /* 10-second diagnostic interval */
+
+        if (xSemaphoreTake(xPrintMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            printf("\n========= SYSTEM HEALTH REPORT =========\n");
+
+            /* Task state table: Name | State | Priority | Stack HWM | Num */
+            vTaskList(pcBuffer);
+            printf("%s\n", pcBuffer);
+
+            /* Heap memory diagnostics */
+            printf("Free Heap: %u bytes remaining\n",
+                   (unsigned int)xPortGetFreeHeapSize());
+
+            printf("=========================================\n\n");
+            xSemaphoreGive(xPrintMutex);
+        }
+    }
+}
+
+/**
+ * @brief Single-consumer telemetry stream logging task.
+ * @details Drains the shared xLogStreamBuffer and outputs each received
+ *          message to the console. Acts as the single consumer in a
+ *          multi-producer single-consumer (MPSC) logging pipeline.
+ *          Null-terminates each received chunk before printing.
+ * @param pvParameter FreeRTOS task parameter — unused.
+ * @note   Stream buffers enforce a single-reader contract. xBufferMutex
+ *         serializes the multiple producer writes on the send side.
+ *         Buffer sized at 129 bytes (128 + null terminator).
+ * @priority 1
+ */
+void vLoggingtask(void *pvParameter) {
+    char  cRxBuffer[128 + 1]; /* +1 for null terminator */
+    size_t xReceivedBytes;
+
+    while(1) {
+        /* Block until bytes arrive in the stream buffer */
+        xReceivedBytes = xStreamBufferReceive(
+            xLogStreamBuffer,
+            cRxBuffer,
+            sizeof(cRxBuffer) - 1, /* Leave room for null terminator */
+            portMAX_DELAY
+        );
+
+        if (xReceivedBytes > 0) {
+            cRxBuffer[xReceivedBytes] = '\0'; /* Null-terminate for safe printf */
+            printf("%s", cRxBuffer);
+        }
+    }
+}
+
+/* ========================================================================== */
+/*                        SYSTEM ENTRY POINT                                  */
+/* ========================================================================== */
+
+/**
+ * @brief System initialization and FreeRTOS scheduler entry point.
+ * @details Creates all FreeRTOS synchronization objects and tasks in the
+ *          correct dependency order. Every creation is validated against
+ *          NULL or pdPASS — any failure triggers a fatal halt, consistent
+ *          with IEC 62304 defensive initialization requirements.
+ *
+ *          Initialization Order:
+ *          1. Stream buffer    — must exist before logging task starts
+ *          2. Mutexes          — must exist before any task calls vLogError
+ *          3. Event group      — must exist before sensor tasks start
+ *          4. Logging task     — must be running before sensor tasks send data
+ *          5. Sensor tasks     — HR, SpO2, BP, Temperature
+ *          6. Alert tasks      — Critical alert, Display
+ *          7. System tasks     — Watchdog (highest priority), Health monitor
+ *          8. Scheduler start  — transfers control to FreeRTOS kernel
+ *
+ * @return  Never returns — control is transferred to vTaskStartScheduler().
+ */
+int main(void) {
+
+    /* ── Stream Buffer ───────────────────────────────────────────────────── */
+    /* Must be created first — logging task and vLogError depend on it       */
+    xLogStreamBuffer = xStreamBufferCreate(1024, 1);
+    if (xLogStreamBuffer == NULL) {
+        printf("[FATAL] Stream buffer creation failed — halting\n");
+        while(1);
+    }
+
+    /* ── Mutexes ─────────────────────────────────────────────────────────── */
+    xPrintMutex = xSemaphoreCreateMutex();
+    if (xPrintMutex == NULL) {
+        printf("[FATAL] Print mutex creation failed — halting\n");
+        while(1);
+    }
+
+    xBufferMutex = xSemaphoreCreateMutex();
+    if (xBufferMutex == NULL) {
+        printf("[FATAL] Buffer mutex creation failed — halting\n");
+        while(1);
+    }
+
+    /* ── Event Group ─────────────────────────────────────────────────────── */
+    xVitalAlertGroup = xEventGroupCreate();
+    if (xVitalAlertGroup == NULL) {
+        printf("[FATAL] Event group creation failed — halting\n");
+        while(1);
+    }
+
+    /* ── Tasks ───────────────────────────────────────────────────────────── */
+
+    /* Logging task created first — must drain buffer before sensor tasks send */
+    BaseType_t LT = xTaskCreate(vLoggingtask, "LoggingTask", 1024, NULL, 1, NULL);
+    if (LT != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "LoggingTask"); while(1); }
+
+    /* Sensor tasks — each monitors one physiological parameter */
+    BaseType_t HR = xTaskCreate(vHeartRate, "HeartRate", 1024, NULL, 4, NULL);
+    if (HR != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "HeartRate"); while(1); }
+
+    BaseType_t SpO2 = xTaskCreate(vSpO2, "SpO2", 1024, NULL, 4, NULL);
+    if (SpO2 != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "SpO2"); while(1); }
+
+    BaseType_t BP = xTaskCreate(vBP, "BloodPressure", 1024, NULL, 3, NULL);
+    if (BP != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "BloodPressure"); while(1); }
+
+    BaseType_t Temp = xTaskCreate(vTemperature, "Temperature", 1024, NULL, 2, NULL);
+    if (Temp != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "Temperature"); while(1); }
+
+    /* Alert tasks — respond to threshold breaches */
+    BaseType_t AT = xTaskCreate(vCriticalAlert, "CriticalAlert", 1024, NULL, 5, NULL);
+    if (AT != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "CriticalAlert"); while(1); }
+
+    /* xDisplayTaskHandle stored globally — sensor tasks use it for xTaskNotify */
+    BaseType_t Display = xTaskCreate(vDisplayTask, "DisplayTask", 1024, NULL, 1, &xDisplayTaskHandle);
+    if (Display != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "DisplayTask"); while(1); }
+
+    /* System monitoring tasks */
+    BaseType_t WatchDog = xTaskCreate(vWatchDogTask, "Watchdog", 1024, NULL, 6, NULL);
+    if (WatchDog != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "Watchdog"); while(1); }
+
+    /* Health monitor gets 2048-word stack — vTaskList() requires extra space */
+    BaseType_t HM = xTaskCreate(vHealthMonitor, "HealthMonitor", 2048, NULL, 1, NULL);
+    if (HM != pdPASS) { vLogError(ERR_TASK_CREATE_FAILED, "HealthMonitor"); while(1); }
+
+    /* Hand control to FreeRTOS kernel — this call never returns */
+    vTaskStartScheduler();
+
+    return 0; /* Never reached */
+}
