@@ -1,0 +1,150 @@
+#include "ARMCM4.h"
+#include <stdbool.h>
+#include <stdio.h>
+
+/**
+ * @brief Direct memory definitions for structural mapping - NO functional logic altered
+ */
+typedef struct { volatile uint32_t MODER; uint32_t OTYPER; uint32_t OSPEEDR; volatile uint32_t PUPDR; uint32_t IDR; uint32_t ODR; uint32_t BSRR; uint32_t LCKR; uint32_t AFR[2]; } GPIO_TypeDef;
+typedef struct { volatile uint32_t SR; volatile uint32_t CR1; volatile uint32_t CR2; uint32_t SMPR1; volatile uint32_t SMPR2; uint32_t JOFR[4]; uint32_t HTR; uint32_t LTR; volatile uint32_t SQR1; uint32_t SQR2; volatile uint32_t SQR3; uint32_t JSQR; uint32_t JDR[4]; volatile uint32_t DR; volatile uint32_t CCR; } ADC_TypeDef;
+typedef struct { volatile uint32_t CR1; uint32_t CR2; uint32_t SMCR; volatile uint32_t DIER; volatile uint32_t SR; uint32_t EGR; uint32_t CCMR1; uint32_t CCMR2; uint32_t CCER; uint32_t CNT; volatile uint32_t PSC; volatile uint32_t ARR; } TIM_TypeDef;
+typedef struct { uint32_t CR; uint32_t PLLCFGR; uint32_t CFGR; uint32_t CIR; uint32_t AHB1RSTR; uint32_t AHB2RSTR; uint32_t AHB3RSTR; uint32_t Reserved0; uint32_t APB1RSTR; uint32_t APB2RSTR; uint32_t Reserved1; volatile uint32_t AHB1ENR; uint32_t AHB2ENR; uint32_t AHB3ENR; uint32_t Reserved2; volatile uint32_t APB1ENR; volatile uint32_t APB2ENR; } RCC_TypeDef;
+
+/* Base addresses and IRQ assignments for STM32F4-like architecture */
+#define GPIOA               ((GPIO_TypeDef *) 0x40020000)
+#define ADC1                ((ADC_TypeDef *)  0x40012000)
+#define TIM2          `      ((TIM_TypeDef *)  0x40000000)
+#define RCC                 ((RCC_TypeDef *)  0x40023800)
+#define TIM2_IRQn           ((IRQn_Type)28)
+#define ADC_IRQn            ((IRQn_Type)18)
+
+/* System Constants */
+#define ADC_CHANNEL 1U            /**< Analog input channel connected to PA1 */
+#define MAX_TEMP_LIMIT 37.5f      /**< Maximum allowable temperature threshold in Celsius */
+#define VREF 3.3f                 /**< Microcontroller analog reference voltage (Volts) */
+#define ADC_RESOLUTION 4095.0f    /**< 12-bit ADC maximum resolution value (2^12 - 1) */
+
+/* Global Variables */
+volatile uint16_t rawADC=0;       /**< Stores the last raw conversion data from ADC1->DR */
+volatile float Temp = 0.0f;       /**< Calculated temperature value in Celsius */
+volatile bool ADCReady=false;     /**< Semaphore flag indicating a new data conversion is ready */
+
+/**
+ * @brief  Initializes GPIOA Pin 1 as an Analog Input.
+ */
+void ADC_GPIO_init(void){
+   RCC->AHB1ENR|=(1<<0);          // Enable clock for GPIOA peripheral
+   GPIOA->MODER&= ~(3<<(1*2));    // Clear mode bits for Pin 1
+   GPIOA->MODER|= (3<<(1*2));     // Set Pin 1 to Analog Mode (11b)
+   GPIOA->PUPDR&= ~(3<<(1*2));    // Configure Pin 1 with No Pull-up, No Pull-down (00b)
+}
+
+/**
+ * @brief  Configures Timer 2 to generate periodic update interrupts.
+ *         Target: 500ms intervals assuming an 84MHz clock source.
+ */
+void TIM2_init(void){
+   RCC->APB1ENR|= (1<<0);         // Enable clock for TIM2 peripheral
+   TIM2->PSC=8399;                // Prescaler: Clock down to 10kHz (84MHz / 8400)
+   TIM2->ARR=4999;                // Auto-Reload: Trigger every 5000 counts (500ms period)
+   TIM2->CR1|= (1<<7);            // Enable Auto-reload preload (ARPE)
+   TIM2->CR1|= (1<<0);            // Enable Timer 2 counter (CEN)
+   TIM2->DIER|= (1<<0);           // Enable Update Interrupt (UIE)
+   NVIC_SetPriority(TIM2_IRQn,2); // Assign priority level 2 to Timer 2
+   NVIC_EnableIRQ(TIM2_IRQn);     // Enable Timer 2 global interrupt in NVIC
+}
+
+/**
+ * @brief  Configures ADC1 for Single Conversion Mode on Channel 1 with End-of-Conversion Interrupt.
+ */
+void ADC_init(void){
+   RCC->APB2ENR|= (1<<8);         // Enable clock for ADC1 peripheral
+   ADC1->CCR&= ~(3<<16);          // Clear ADC clock prescaler bits
+   ADC1->CCR|= (1<<16);           // Set ADC clock prescaler to PCLK2 divided by 4
+   ADC1->CR1&= ~(1<<24);          // Set 12-bit resolution (00b)
+   ADC1->CR1&= ~(1<<8);           // Disable Scan Mode
+   ADC1->CR1|= (1<<5);            // Enable Interrupt on End of Conversion (EOCIE)
+   ADC1->CR2&= ~(1<<1);           // Configure Single Conversion Mode (Continuous disabled)
+   ADC1->CR2&= ~(1<<11);          // Set Data Alignment to Right Aligned
+   ADC1->SMPR2&= ~(7 << ADC_CHANNEL * 3); // Clear sample time bits for Channel 1
+   ADC1->SMPR2|= (7<< ADC_CHANNEL * 3);  // Set max sample time for Channel 1 (480 cycles)
+   ADC1->SQR3&= ~(0x1F<< 0);      // Clear 1st conversion sequence slot
+   ADC1->SQR3|= (ADC_CHANNEL<<0); // Map Channel 1 as the 1st conversion sequence item
+   ADC1->SQR1&= ~(0xF << 20);     // Set sequence length to 1 conversion (0000b)
+   ADC1->CR2|= (1<<0);            // Power on the ADC peripheral (ADON)
+   for(volatile int i=0;i<1000;i++); // Mandatory stabilization delay after ADC power-up
+   NVIC_SetPriority(ADC_IRQn,1);  // Assign higher priority (level 1) to ADC for processing data
+   NVIC_EnableIRQ(ADC_IRQn);      // Enable ADC global interrupt in NVIC
+}
+
+/**
+ * @brief  Triggers the start of a regular channel software ADC conversion.
+ */
+void ADC_START(void){
+   ADC1->CR2|= (1<<30);           // Set SWSTART bit to initiate conversion
+}
+
+/**
+ * @brief  ADC Global Interrupt Handler.
+ *         Executes when a conversion finishes and updates the data pool.
+ */
+void ADC_IRQHandler(void){
+   if(ADC1->SR & (1<<1)){         // Verify if the End-of-Conversion (EOC) flag is set
+      rawADC=ADC1->DR;            // Read conversion result (clears the EOC flag automatically)
+      ADCReady=true;              // Raise flag to alert the main polling loop
+   }
+}
+
+/**
+ * @brief  Timer 2 Global Interrupt Handler.
+ *         Triggers a new ADC software conversion at every timer expiration.
+ */
+void TIM2_IRQHandler(void){
+   if(TIM2->SR & (1<<0)){         // Verify if the Update Interrupt Flag (UIF) is active
+      TIM2->SR&= ~(1<<0);         // Clear the UIF flag to acknowledge the interrupt
+      ADC_START();                // Trigger a new ADC conversion
+   }
+}
+
+/**
+ * @brief  Converts raw 12-bit digital conversion values into an analog voltage.
+ * @param  raw: The digital integer readout from the ADC data register.
+ * @return Calculated voltage scaling across the analog operational window.
+ */
+float ADC_TO_VOLTAGE(uint16_t raw){
+   return ((float)raw/ADC_RESOLUTION)*VREF;
+}
+
+/**
+ * @brief  Transforms measured voltage into temperature Celsius.
+ *         Calibrated for sensors like TMP36 (0.5V offset, 10mV/°C slope).
+ * @param  volt: The calculated analog input voltage.
+ * @return Temperature value in degrees Celsius.
+ */
+float VoltageToTemp(float volt){
+   return (volt-0.5f)*100.0f;
+}
+
+/**
+ * @brief  Main runtime entry point. Polling loop handles math and safety thresholds.
+ */
+int main(void){
+	 volatile uint8_t alertTriggered = 0; // State flag monitoring thermal overrun events
+   ADC_GPIO_init();               // Initialize the hardware port pins
+   ADC_init();                    // Setup analog converter configurations
+   TIM2_init();                   // Fire up the timer execution intervals
+   while(1){
+      while(!ADCReady);           // Block execution and wait for the ADC ISR flag to set
+      ADCReady=false;             // Consume and reset the flag
+      float voltage=ADC_TO_VOLTAGE(rawADC); // Convert raw register value to voltage
+      Temp=VoltageToTemp(voltage);          // Translate voltage to Celsius scale
+      
+      /* Safety Threshold Verification */
+      if(Temp>MAX_TEMP_LIMIT){
+          alertTriggered = 1;     // Set alarm status flag if limit exceeded
+      }
+      else{
+          alertTriggered = 0;     // Safe operation reset condition
+      }
+   }
+}
