@@ -1,0 +1,253 @@
+/*******************************************************************************
+ * SYSTEM ARCHITECTURE OVERVIEW: FreeRTOS Ventilator Control Simulation
+ *
+ * 1. SHARED RESOURCE PROTECTION:
+ *    - Uses `xVentilatorMutex` to safeguard concurrent read/writes to `VentState`.
+ *    - Uses `xPrintMutex` to protect standard output streams from corruption.
+ *
+ * 2. TASK SCHEDULING & DYNAMICS:
+ *    - vWatchDog (Priority 6): Supervises system execution cycles every 3.5s.
+ *    - vAlarmManagerTask (Priority 5): Dispatches events and logs warnings.
+ *    - vPressureMonitor (Priority 4): Samples simulated pressure loops every 100ms.
+ *    - vBreathingTask (Priority 3): Simulates dynamic respiration phases at 20 BPM.
+ ******************************************************************************/
+
+#include <stdio.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "timers.h"
+#include <stdlib.h>  
+#include "semphr.h"
+#include "event_groups.h"
+#include "stream_buffer.h"
+#include <stdint.h>
+
+/* Operational Operational Bounds */
+#define MAX_PRESSURE      30.0f
+#define MIN_PRESSURE       5.0f
+
+/* Supervisor Identification Bitmasks */
+#define WATCHDOG_BREATHING (1 << 0)
+#define WATCHDOG_PRESSURE  (1 << 1)
+#define WATCHDOG_ALL      (WATCHDOG_BREATHING | WATCHDOG_PRESSURE)
+
+/* Warning Status Notification Flag Vectors */
+#define BIT_HIGH_PRESSURE      (1 << 0)
+#define BIT_CIRCUIT_DISCONNECT (1 << 1)
+
+/* Mathematical Constant Mapping to achieve 20 BPM (Total Cycle Duration = 3000ms) */
+#define ONE_MINUTE_MS     60000UL
+#define INHALE_MS         1000UL    /* Inhalation Duration (1s) */
+#define PAUSE1_MS         250UL     /* Post-Inhale Plateau (250ms) */
+#define EXHALE_MS         1500UL    /* Exhalation Duration (1.5s) */
+#define PAUSE2_MS         250UL     /* Post-Exhale Plateau (250ms) */
+
+/* Structural Thread Sync Tools */
+SemaphoreHandle_t xVentilatorMutex;
+SemaphoreHandle_t xPrintMutex;
+QueueHandle_t xCycleQueue;
+EventGroupHandle_t xAlarmEvent;
+volatile uint32_t ulWatchDogKickRegister=0;
+
+/* Shared State Memory Data Blocks */
+typedef struct {
+    float    airway_pressure;   // cmH2O
+    uint32_t breath_rate;       // breaths per minute
+} VentilatorState_t;
+
+/* Communication Queue Structures */
+typedef struct {
+    uint32_t cycle_number;
+    uint32_t breath_rate_bpm;
+} CycleEvent_t;
+
+VentilatorState_t VentState;
+CycleEvent_t txEvent;
+
+/**
+ * @brief High Frequency Sensor Sample Task (Priority 4)
+ *        Runs every 100ms to monitor critical safety metrics.
+ */
+void vPressureMonitor(void *parameter){
+   TickType_t xLastWakeTime=xTaskGetTickCount();
+   ulWatchDogKickRegister|=WATCHDOG_PRESSURE; /* System initialization kick */
+   while(1){
+      vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(100)); /* Periodic wake execution anchor */
+      int Pressure=10+rand()%25; /* Random range variable generation: 10 to 34 inclusive */
+      
+      /* Safely push generated pressure value to shared telemetry structure */
+      if(xSemaphoreTake(xVentilatorMutex,pdMS_TO_TICKS(10))==pdTRUE){
+         VentState.airway_pressure=Pressure;
+         xSemaphoreGive(xVentilatorMutex);
+      }
+      
+      /* Validate and set notification flags based on target safety limits */
+      if(Pressure>30){
+         xEventGroupSetBits(xAlarmEvent,BIT_HIGH_PRESSURE);
+      }
+      else if(Pressure<5){
+         xEventGroupSetBits(xAlarmEvent,BIT_CIRCUIT_DISCONNECT);
+      }
+      
+      ulWatchDogKickRegister|=WATCHDOG_PRESSURE; /* Re-register active run signature */
+   }
+}
+
+/**
+ * @brief Physiological Waveform Control Task (Priority 3)
+ *        Executes exact phase patterns maintaining a 20 BPM rate profile.
+ */
+void vBreathingTask(void *parameter){
+   uint32_t TotalTime=0;
+   uint16_t cycleCounter=0;
+   ulWatchDogKickRegister|=WATCHDOG_BREATHING; /* System initialization kick */
+   while(1){
+      TickType_t StartTick=xTaskGetTickCount();
+      uint32_t StartTime=pdTICKS_TO_MS(StartTick);
+      
+      /* Sequential execution of precise timing parameters */
+      vTaskDelay(pdMS_TO_TICKS(INHALE_MS));
+      vTaskDelay(pdMS_TO_TICKS(PAUSE1_MS));
+      vTaskDelay(pdMS_TO_TICKS(EXHALE_MS));
+      vTaskDelay(pdMS_TO_TICKS(PAUSE2_MS));
+      
+      TickType_t EndTick=xTaskGetTickCount();
+      uint32_t EndTime=pdTICKS_TO_MS(EndTick);
+      
+      /* Formulate actual mathematical execution rate (evaluates precisely to 20 BPM) */
+      int BreathRate=ONE_MINUTE_MS/(EndTime-StartTime);
+      cycleCounter++;
+      
+      /* Thread-safe updates to the core global record structure */
+      if(xSemaphoreTake(xVentilatorMutex,pdMS_TO_TICKS(10))==pdTRUE){
+         VentState.breath_rate=BreathRate;
+         xSemaphoreGive(xVentilatorMutex);
+      }
+      
+      /* Populate data records and dispatch to operational queue */
+      txEvent.cycle_number=cycleCounter;
+      txEvent.breath_rate_bpm=BreathRate;
+      xQueueSend(xCycleQueue,&txEvent,0);
+      
+      ulWatchDogKickRegister|=WATCHDOG_BREATHING; /* Re-register active run signature */
+   }
+}
+
+/**
+ * @brief Thread Asynchronous Messaging & Evaluation Task (Priority 5)
+ *        Consumes pipeline updates and logs status warnings.
+ */
+void vAlarmManagerTask(void *parameter){
+   CycleEvent_t rxEvent;
+   while(1){
+      /* Non-blocking sample check across warning event bits */
+      EventBits_t bits=xEventGroupWaitBits(xAlarmEvent,BIT_HIGH_PRESSURE|BIT_CIRCUIT_DISCONNECT,pdTRUE,pdFALSE,pdMS_TO_TICKS(50));
+      
+      /* Evaluate condition criteria logs matching current warning state profiles */
+      if(bits&BIT_HIGH_PRESSURE){
+        if(xSemaphoreTake(xPrintMutex,pdMS_TO_TICKS(100))==pdTRUE){
+            printf("[ALARM] Airway pressure critical\n");
+            xSemaphoreGive(xPrintMutex);
+        }
+      }
+      if(bits&BIT_CIRCUIT_DISCONNECT){
+        if(xSemaphoreTake(xPrintMutex,pdMS_TO_TICKS(100))==pdTRUE){
+            printf("[ALARM] Patient circuit disconnected — check tubing\n");
+            xSemaphoreGive(xPrintMutex);
+        }
+      }
+      
+      /* Periodically extract episodic logs from the shared message pipeline queue */
+      if(xQueueReceive(xCycleQueue,&rxEvent,pdMS_TO_TICKS(50))==pdPASS){
+        if(xSemaphoreTake(xPrintMutex,pdMS_TO_TICKS(100))==pdTRUE){
+            printf("[VENT] Cycle complete — Rate: %u bpm\n",rxEvent.breath_rate_bpm);
+            xSemaphoreGive(xPrintMutex);
+        }
+      }
+   }
+}
+
+/**
+ * @brief Safety Supervisor Task (Priority 6)
+ *        Monitors system thread health every 3.5 seconds.
+ */
+void vWatchDog(void *parameter){
+    TickType_t xLastWakeTime=xTaskGetTickCount();
+    while(1){
+        vTaskDelay(pdMS_TO_TICKS(3500)); /* Wait interval matches target breathing cycle frame width comfortably */
+        
+        /* Verify all component modules kicked the verification bitfield register */
+        if((ulWatchDogKickRegister&WATCHDOG_ALL)==WATCHDOG_ALL){
+            ulWatchDogKickRegister=0; /* Reset state tracker flags for next interval window */
+            if(xSemaphoreTake(xPrintMutex,pdMS_TO_TICKS(100))==pdTRUE){
+                printf("All Tasks Alive\n");
+                xSemaphoreGive(xPrintMutex);
+            }
+        }
+        else{
+            /* Trigger systemic safety freeze sequence if thread loop execution fails */
+            if(xSemaphoreTake(xPrintMutex,pdMS_TO_TICKS(100))==pdTRUE){
+                printf("[WATCHDOG] Task timeout detected\n");
+                printf("[VENT] SAFE SHUTDOWN — manual ventilation required\n");
+                xSemaphoreGive(xPrintMutex);
+            }
+            while(1); /* Infinite loop configuration forces hardware fallback lock */
+        }
+    }
+}
+
+/**
+ * @brief Primary Initialization Entry Point. Allocates dependencies and starts the system.
+ */
+int main(void){
+    // 1. Safe Allocation of Mutexes
+    xVentilatorMutex = xSemaphoreCreateMutex();
+    xPrintMutex = xSemaphoreCreateMutex();
+    
+    // Safety Fallback Check: Stop immediately if allocations fail
+    if(xVentilatorMutex == NULL || xPrintMutex == NULL){
+        printf( "Critical Error: Mutex creation failed!\n");
+        while(1);
+    }
+
+    // 2. Safe Allocation of Communication Queues
+    xCycleQueue = xQueueCreate(5, sizeof(CycleEvent_t));
+    if(xCycleQueue == NULL){
+        fprintf(stderr, "Critical Error: Queue creation failed!\n");
+        return 1;
+    }
+
+    // 3. Safe Allocation of Event Groups
+    xAlarmEvent = xEventGroupCreate();
+    if(xAlarmEvent == NULL){
+        fprintf(stderr, "Critical Error: Event Group creation failed!\n");
+        return 1;
+    }
+
+    // 4. Thread Task Allocations with Explicit Priority Check Validation
+    if(xTaskCreate(vPressureMonitor, "Pressure Monitor Task", 1024, NULL, 4, NULL) != pdPASS) {
+        printf( "Critical Error: Pressure Monitor Task creation failed!\n");
+        while(1);
+    }
+
+    if(xTaskCreate(vBreathingTask, "Breathing Cycle Task", 1024, NULL, 3, NULL) != pdPASS) {
+        printf( "Critical Error: Breathing Cycle Task creation failed!\n");
+        while(1);
+    }
+
+    if(xTaskCreate(vAlarmManagerTask, "Alarm Manager Task", 1024, NULL, 5, NULL) != pdPASS) {
+        printf( "Critical Error: Alarm Manager Task creation failed!\n");
+        while(1);
+    }
+
+    if(xTaskCreate(vWatchDog, "Watch Dog Task", 1024, NULL, 6, NULL) != pdPASS) {
+        printf( "Critical Error: Watch Dog Task creation failed!\n");
+        while(1);
+    }
+
+    // 5. Fire up the FreeRTOS Scheduler engine cleanly
+    vTaskStartScheduler();
+
+    // If the scheduler started successfully, this line will never be reached
+    return 0;
+}
