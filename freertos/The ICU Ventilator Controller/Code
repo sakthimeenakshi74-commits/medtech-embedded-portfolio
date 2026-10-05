@@ -70,8 +70,8 @@ CycleEvent_t txEvent;
  */
 void vPressureMonitor(void *parameter){
    TickType_t xLastWakeTime=xTaskGetTickCount();
-   ulWatchDogKickRegister|=WATCHDOG_PRESSURE; /* System initialization kick */
    while(1){
+      ulWatchDogKickRegister|=WATCHDOG_PRESSURE; /* WatchDog kick */
       vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(100)); /* Periodic wake execution anchor */
       int Pressure=10+rand()%25; /* Random range variable generation: 10 to 34 inclusive */
       
@@ -100,8 +100,8 @@ void vPressureMonitor(void *parameter){
 void vBreathingTask(void *parameter){
    uint32_t TotalTime=0;
    uint16_t cycleCounter=0;
-   ulWatchDogKickRegister|=WATCHDOG_BREATHING; /* System initialization kick */
    while(1){
+      ulWatchDogKickRegister|=WATCHDOG_BREATHING; /* WatchDog kick */
       TickType_t StartTick=xTaskGetTickCount();
       uint32_t StartTime=pdTICKS_TO_MS(StartTick);
       
