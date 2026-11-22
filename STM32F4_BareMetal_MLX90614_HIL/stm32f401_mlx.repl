@@ -1,0 +1,6 @@
+
+using "platforms/cpus/stm32f4.repl"
+timer2:
+    frequency: 84000000
+
+mlx90614: Mocks.DummyI2CSlave @ i2c1 0x5A
