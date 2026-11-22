@@ -8,20 +8,6 @@ An **IEC 62304-inspired** real-time patient monitoring system simulation built o
 * **Defensive Firmware Architectural Patterns:** Uses bounded mutex timeouts to prevent deadlocks, strict input boundary checks and a prioritized software watchdog loop.
 * **Advanced FreeRTOS Inter-Task Communication (ITC):** Demonstrates high-performance, low-overhead primitives (Stream Buffers, Event Groups and Task Notifications).
 
-### 🏗️ System Architecture
-
-┌──────────────────────────────────────────────────────────┐
-│  Sensor Tasks: HR(P4), SpO2(P4), BP(P3), Temp(P2)       │
-│       │                │                                 │
-│  Stream Buffer    Event Group         Task Notification  │
-│  (telemetry log)  (abnormal detect)   (UI alert)        │
-│       │                │                    │            │
-│  Logging Task    Critical Alert Task   Display Task     │
-│  (P1)            (P5)                  (P1)             │
-│                                                          │
-│  Watchdog Task (P6) ──► Safe Shutdown on failure        │
-│  Health Monitor (P1) ──► System diagnostics every 10s  │
-└──────────────────────────────────────────────────────────┘
 
 ### Task Priority Hierarchy (Deterministic Design)
 
